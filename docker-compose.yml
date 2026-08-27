@@ -1,0 +1,391 @@
+version: "3.9"
+
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "50m"
+    max-file: "3"
+
+x-backend-env: &backend-env
+  DATABASE_URL: "postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+  DATABASE_URL_SYNC: "postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}"
+  REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+  QDRANT_URL: "http://qdrant:6333"
+  NEO4J_URI: "bolt://neo4j:7687"
+  NEO4J_USER: "${NEO4J_USER}"
+  NEO4J_PASSWORD: "${NEO4J_PASSWORD}"
+  ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
+  SECRET_KEY: "${SECRET_KEY}"
+  ENVIRONMENT: "${ENVIRONMENT:-production}"
+  LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+  MOCK_MODELS: "${MOCK_MODELS:-false}"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+  PYTHONPATH: "/app"
+  RAW_FILES_PATH: "/data/raw"
+  MODEL_CACHE_PATH: "/data/models"
+
+services:
+  # ─── Infrastructure ────────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: aeimps-postgres
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-aeimps}"
+      POSTGRES_USER: "${POSTGRES_USER:-aeimps}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-aeimps_secret}"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-aeimps} -d ${POSTGRES_DB:-aeimps}"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: "4G"
+
+  redis:
+    image: redis:7-alpine
+    container_name: aeimps-redis
+    restart: unless-stopped
+    logging: *default-logging
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-redis_secret}
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: "2G"
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    container_name: aeimps-qdrant
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - ./infrastructure/qdrant/config.yaml:/qdrant/config/production.yaml:ro
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/readyz || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    networks:
+      - aeimps-net
+    ports:
+      - "6333:6333"
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: "8G"
+
+  neo4j:
+    image: neo4j:5.18-community
+    container_name: aeimps-neo4j
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+      - ./infrastructure/neo4j/neo4j.conf:/conf/neo4j.conf:ro
+    environment:
+      NEO4J_AUTH: "${NEO4J_USER:-neo4j}/${NEO4J_PASSWORD:-neo4j_secret}"
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: "apoc.*"
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u ${NEO4J_USER:-neo4j} -p ${NEO4J_PASSWORD:-neo4j_secret} 'RETURN 1' || exit 1"]
+      interval: 20s
+      timeout: 15s
+      retries: 10
+      start_period: 60s
+    networks:
+      - aeimps-net
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: "4G"
+
+  # ─── Application ──────────────────────────────────────────────────────────
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: ../infrastructure/docker/api.Dockerfile
+    container_name: aeimps-api
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+      PORT: "8000"
+      WORKERS: "4"
+    ports:
+      - "8000:8000"
+    volumes:
+      - raw_files:/data/raw
+      - model_cache:/data/models
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/admin/health/live || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: "4G"
+
+  worker-doc-processor:
+    build:
+      context: ./backend
+      dockerfile: ../infrastructure/docker/worker.Dockerfile
+    container_name: aeimps-worker-doc-processor
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["python", "-m", "workers.document_processor.worker"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+      WORKER_CONCURRENCY: "2"
+    volumes:
+      - raw_files:/data/raw
+      - model_cache:/data/models
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: "8G"
+      replicas: 1
+
+  worker-embedding:
+    build:
+      context: ./backend
+      dockerfile: ../infrastructure/docker/worker.Dockerfile
+    container_name: aeimps-worker-embedding
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["python", "-m", "workers.embedding_worker.worker"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+      EMBEDDING_BATCH_SIZE: "32"
+      EMBEDDING_MODEL: "BAAI/bge-large-en-v1.5"
+    volumes:
+      - raw_files:/data/raw
+      - model_cache:/data/models
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: "16G"
+
+  worker-kg:
+    build:
+      context: ./backend
+      dockerfile: ../infrastructure/docker/worker.Dockerfile
+    container_name: aeimps-worker-kg
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["python", "-m", "workers.kg_worker.worker"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+    volumes:
+      - model_cache:/data/models
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: "4G"
+
+  worker-vision:
+    build:
+      context: ./backend
+      dockerfile: ../infrastructure/docker/vision.Dockerfile
+    container_name: aeimps-worker-vision
+    restart: unless-stopped
+    logging: *default-logging
+    command: ["python", "-m", "workers.vision_worker.worker"]
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      <<: *backend-env
+      VISION_MODEL: "Qwen/Qwen2-VL-7B-Instruct"
+      VISION_MAX_IMAGE_SIZE: "2048"
+    volumes:
+      - raw_files:/data/raw
+      - model_cache:/data/models
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: "24G"
+    # Uncomment when GPU is available:
+    # runtime: nvidia
+    # environment:
+    #   NVIDIA_VISIBLE_DEVICES: all
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: aeimps-frontend
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - api
+    environment:
+      NEXT_PUBLIC_API_URL: "http://localhost:8000"
+      NEXT_PUBLIC_APP_NAME: "AEIMPS"
+    ports:
+      - "3000:3000"
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: "1G"
+
+  # ─── Observability ────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    container_name: aeimps-prometheus
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infrastructure/prometheus/alerts:/etc/prometheus/alerts:ro
+      - prometheus_data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=30d"
+      - "--web.enable-lifecycle"
+      - "--web.enable-admin-api"
+    ports:
+      - "9090:9090"
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: "2G"
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: aeimps-grafana
+    restart: unless-stopped
+    logging: *default-logging
+    depends_on:
+      - prometheus
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./infrastructure/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+    environment:
+      GF_SECURITY_ADMIN_USER: "${GRAFANA_USER:-admin}"
+      GF_SECURITY_ADMIN_PASSWORD: "${GRAFANA_PASSWORD:-grafana_secret}"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+    ports:
+      - "3001:3000"
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: "1G"
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.101.0
+    container_name: aeimps-otel
+    restart: unless-stopped
+    logging: *default-logging
+    volumes:
+      - ./infrastructure/otel/otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus metrics
+    networks:
+      - aeimps-net
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: "512M"
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  neo4j_data:
+  neo4j_logs:
+  raw_files:
+  model_cache:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  aeimps-net:
+    driver: bridge

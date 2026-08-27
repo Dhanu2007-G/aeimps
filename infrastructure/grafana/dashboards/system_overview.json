@@ -1,0 +1,48 @@
+{
+  "title": "AEIMPS System Overview",
+  "uid": "aeimps-overview",
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "Request Rate",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "targets": [{"expr": "rate(http_requests_total[5m])", "legendFormat": "req/s"}]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Error Rate",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "targets": [{"expr": "rate(http_requests_total{status_code=~'5..'}[5m]) / rate(http_requests_total[5m])", "legendFormat": "error%"}]
+    },
+    {
+      "id": 3, "type": "stat", "title": "P95 Latency",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "targets": [{"expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))", "legendFormat": "p95"}]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Avg Eval Score (24h)",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "targets": [{"expr": "avg_over_time(aeimps_eval_overall_score_avg[24h])", "legendFormat": "score"}]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "HTTP Requests by Status",
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 4},
+      "targets": [{"expr": "rate(http_requests_total[1m])", "legendFormat": "{{status_code}} {{handler}}"}]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "API Latency Percentiles",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "targets": [
+        {"expr": "histogram_quantile(0.50, rate(http_request_duration_seconds_bucket[5m]))", "legendFormat": "p50"},
+        {"expr": "histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))", "legendFormat": "p95"},
+        {"expr": "histogram_quantile(0.99, rate(http_request_duration_seconds_bucket[5m]))", "legendFormat": "p99"}
+      ]
+    },
+    {
+      "id": 7, "type": "table", "title": "Worker Heartbeats",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "targets": [{"expr": "time() - aeimps_worker_heartbeat_timestamp", "legendFormat": "{{worker}} age(s)"}]
+    }
+  ]
+}

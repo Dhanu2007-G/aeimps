@@ -1,0 +1,44 @@
+groups:
+  - name: aeimps_critical
+    rules:
+      - alert: APIHighErrorRate
+        expr: rate(http_requests_total{status_code=~"5.."}[5m]) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "High API error rate: {{ $value | humanizePercentage }}"
+
+      - alert: WorkerHeartbeatMissing
+        expr: time() - aeimps_worker_heartbeat_timestamp > 180
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Worker {{ $labels.worker }} not responding"
+
+  - name: aeimps_warnings
+    rules:
+      - alert: EvalScoreDegraded
+        expr: avg_over_time(aeimps_eval_overall_score_avg[1h]) < 0.65
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Evaluation score below threshold: {{ $value }}"
+
+      - alert: RetrievalLatencyHigh
+        expr: histogram_quantile(0.95, rate(http_request_duration_seconds_bucket{handler="/api/v1/retrieve/search"}[5m])) > 3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "P95 retrieval latency {{ $value }}s"
+
+      - alert: QueueDepthHigh
+        expr: aeimps_stream_length > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Stream {{ $labels.stream }} depth: {{ $value }}"

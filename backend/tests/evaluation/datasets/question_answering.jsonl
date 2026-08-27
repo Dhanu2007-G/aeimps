@@ -1,0 +1,8 @@
+{"query": "What caused the payment service outage in February 2024?", "answer": "The auth-service Redis connection pool was undersized (maxconn=10). During a traffic spike, connections queued and timed out, causing payment-service retries that amplified the load."}
+{"query": "What are the immediate steps to take during a payment service incident?", "answer": "Check payment-service logs with kubectl, verify database connections via pg_stat_activity, check Redis health, and scale up if CPU exceeds 80%."}
+{"query": "What is the SLO for the payment service?", "answer": "99.9% uptime with p99 latency under 500ms."}
+{"query": "What action items came from the February 2024 postmortem?", "answer": "Increase auth-service Redis pool to 100 connections, add circuit breaker on payment-service to auth-service calls, set up connection pool utilization alerts, and load test auth-service at 5x peak traffic."}
+{"query": "What triggers a rollback during deployment?", "answer": "Error rate above 2% sustained for 5 minutes, P99 latency more than 2x pre-deployment baseline, or any SEV-1 or SEV-2 alert firing."}
+{"query": "Which service has the highest requests per day?", "answer": "The /api/v1/users/profile GET endpoint with 890,000 requests per day."}
+{"query": "What dependencies does the auth service have?", "answer": "The auth service depends on PostgreSQL for user storage and Redis for session caching."}
+{"query": "What is the notification service p99 latency?", "answer": "5,400 milliseconds (5.4 seconds) based on the performance report."}

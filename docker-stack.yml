@@ -1,0 +1,315 @@
+version: "3.9"
+
+x-backend-env: &backend-env
+  DATABASE_URL: "postgresql+asyncpg://aeimps:${POSTGRES_PASSWORD}@postgres:5432/aeimps"
+  DATABASE_URL_SYNC: "postgresql://aeimps:${POSTGRES_PASSWORD}@postgres:5432/aeimps"
+  REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379/0"
+  QDRANT_URL: "http://qdrant:6333"
+  NEO4J_URI: "bolt://neo4j:7687"
+  NEO4J_USER: "neo4j"
+  NEO4J_PASSWORD_FILE: "/run/secrets/neo4j_password"
+  POSTGRES_PASSWORD_FILE: "/run/secrets/postgres_password"
+  REDIS_PASSWORD_FILE: "/run/secrets/redis_password"
+  ANTHROPIC_API_KEY_FILE: "/run/secrets/anthropic_api_key"
+  SECRET_KEY_FILE: "/run/secrets/secret_key"
+  ENVIRONMENT: "production"
+  LOG_LEVEL: "INFO"
+  MOCK_MODELS: "false"
+  OTEL_EXPORTER_OTLP_ENDPOINT: "http://otel-collector:4317"
+  PYTHONPATH: "/app"
+  RAW_FILES_PATH: "/data/raw"
+  MODEL_CACHE_PATH: "/data/models"
+
+secrets:
+  postgres_password:
+    external: true
+  redis_password:
+    external: true
+  neo4j_password:
+    external: true
+  anthropic_api_key:
+    external: true
+  secret_key:
+    external: true
+
+networks:
+  aeimps-net:
+    driver: overlay
+    attachable: true
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  neo4j_data:
+  grafana_data:
+  prometheus_data:
+  raw_files:
+  model_cache:
+  backup_data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    secrets:
+      - postgres_password
+    environment:
+      POSTGRES_DB: aeimps
+      POSTGRES_USER: aeimps
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    networks:
+      - aeimps-net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "2"
+          memory: "4G"
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+
+  redis:
+    image: redis:7-alpine
+    secrets:
+      - redis_password
+    command: sh -c 'redis-server --requirepass $$(cat /run/secrets/redis_password) --appendonly yes --appendfsync everysec --maxmemory 2gb --maxmemory-policy allkeys-lru'
+    volumes:
+      - redis_data:/data
+    networks:
+      - aeimps-net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "1"
+          memory: "2G"
+      restart_policy:
+        condition: on-failure
+
+  qdrant:
+    image: qdrant/qdrant:v1.9.0
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - aeimps-net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "2"
+          memory: "4G"
+      restart_policy:
+        condition: on-failure
+
+  neo4j:
+    image: neo4j:5.18-community
+    secrets:
+      - neo4j_password
+    environment:
+      NEO4J_AUTH: neo4j/$$(cat /run/secrets/neo4j_password)
+      NEO4J_PLUGINS: '["apoc"]'
+    volumes:
+      - neo4j_data:/data
+    networks:
+      - aeimps-net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      resources:
+        limits:
+          cpus: "2"
+          memory: "4G"
+      restart_policy:
+        condition: on-failure
+
+  api:
+    image: aeimps-api:latest
+    secrets:
+      - postgres_password
+      - redis_password
+      - neo4j_password
+      - anthropic_api_key
+      - secret_key
+    environment: *backend-env
+    volumes:
+      - raw_files:/data/raw
+      - model_cache:/data/models
+    networks:
+      - aeimps-net
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+        order: start-first
+      rollback_config:
+        parallelism: 1
+        delay: 5s
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: "2"
+          memory: "4G"
+
+  worker-doc-processor:
+    image: aeimps-api:latest
+    command: python -m workers.document_processor.worker
+    secrets:
+      - postgres_password
+      - redis_password
+    environment: *backend-env
+    volumes:
+      - raw_files:/data/raw
+      - model_cache:/data/models
+    networks:
+      - aeimps-net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+      resources:
+        limits:
+          cpus: "2"
+          memory: "4G"
+
+  worker-embedding:
+    image: aeimps-api:latest
+    command: python -m workers.embedding_worker.worker
+    secrets:
+      - postgres_password
+      - redis_password
+    environment: *backend-env
+    volumes:
+      - model_cache:/data/models
+    networks:
+      - aeimps-net
+    deploy:
+      replicas: 1
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          cpus: "4"
+          memory: "8G"
+
+  backup:
+    image: aeimps-backup:latest
+    secrets:
+      - postgres_password
+      - redis_password
+      - neo4j_password
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_DB: aeimps
+      POSTGRES_USER: aeimps
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      REDIS_HOST: redis
+      NEO4J_HOST: neo4j
+      QDRANT_URL: http://qdrant:6333
+      BACKUP_RETENTION_DAYS: 7
+      BACKUP_SCHEDULE: "0 2 * * *"
+    volumes:
+      - backup_data:/backups
+      - redis_data:/redis_data:ro
+      - qdrant_data:/qdrant_data:ro
+    networks:
+      - aeimps-net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+
+  prometheus:
+    image: prom/prometheus:latest
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=30d'
+    volumes:
+      - ./infrastructure/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./infrastructure/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+    networks:
+      - aeimps-net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+
+  grafana:
+    image: grafana/grafana:latest
+    secrets:
+      - source: grafana_admin_password
+        target: /run/secrets/grafana_password
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_password
+      GF_INSTALL_PLUGINS: "grafana-piechart-panel"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./infrastructure/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./infrastructure/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    networks:
+      - aeimps-net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
+
+  frontend:
+    image: aeimps-frontend:latest
+    environment:
+      NEXT_PUBLIC_API_URL: "http://api:8000"
+    networks:
+      - aeimps-net
+    deploy:
+      replicas: 2
+      update_config:
+        parallelism: 1
+        delay: 10s
+        order: start-first
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          cpus: "1"
+          memory: "1G"
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/nginx/ssl:/etc/nginx/ssl:ro
+    networks:
+      - aeimps-net
+    deploy:
+      placement:
+        constraints:
+          - node.role == manager
+      restart_policy:
+        condition: on-failure
